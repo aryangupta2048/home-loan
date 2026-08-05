@@ -1,369 +1,275 @@
 """
-Home Loan / EMI Advisor
-========================
-RE-03 | Intermediate | Chain + Financial Calculator Tool
+🏠 Home Loan / EMI Advisor
+---------------------------
+A simple Streamlit app that helps a user:
+1. Calculate their monthly EMI (Equated Monthly Installment)
+2. Check whether they are likely eligible for the loan
+3. View a month-by-month amortization (repayment) schedule
+4. Get easy-to-understand loan advice from Google Gemini (AI)
 
-A Streamlit app that combines a custom-built financial calculator
-(EMI, amortization, eligibility) with a LangChain chain that turns
-the raw numbers into a personalized, plain-English loan recommendation.
+This project is intentionally kept simple (plain functions, no classes,
+no advanced patterns) so it is easy to explain in a college presentation.
 
-Run:
-    streamlit run app.py
+Author: Student Project (RE-03)
 """
 
-import math
-from datetime import date
-
-import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
+import pandas as pd
+import matplotlib.pyplot as plt
+import google.generativeai as genai
 
-# ----------------------------------------------------------------------------
-# LangChain is optional at import time — the app still works (in rule-based
-# mode) if it isn't installed or no API key is supplied.
-# ----------------------------------------------------------------------------
-try:
-    from langchain_core.prompts import ChatPromptTemplate
-    from langchain_core.output_parsers import StrOutputParser
-    from langchain_core.runnables import RunnableLambda
-    from langchain_openai import ChatOpenAI
-
-    LANGCHAIN_AVAILABLE = True
-except Exception:
-    LANGCHAIN_AVAILABLE = False
-
-
-# =============================================================================
-# 1. CUSTOM FINANCIAL CALCULATOR TOOL
-#    (Plain Python — this is the "financial calculator tool" the chain wraps)
-# =============================================================================
-class LoanCalculator:
-    """Custom calculator tool for EMI, amortization and eligibility maths."""
-
-    @staticmethod
-    def monthly_rate(annual_rate_pct: float) -> float:
-        return (annual_rate_pct / 100) / 12
-
-    @classmethod
-    def calculate_emi(cls, principal: float, annual_rate_pct: float, tenure_years: float) -> float:
-        """Standard reducing-balance EMI formula."""
-        r = cls.monthly_rate(annual_rate_pct)
-        n = int(round(tenure_years * 12))
-        if r == 0:
-            return principal / n
-        emi = principal * r * (1 + r) ** n / ((1 + r) ** n - 1)
-        return emi
-
-    @classmethod
-    def amortization_schedule(cls, principal: float, annual_rate_pct: float, tenure_years: float) -> pd.DataFrame:
-        r = cls.monthly_rate(annual_rate_pct)
-        n = int(round(tenure_years * 12))
-        emi = cls.calculate_emi(principal, annual_rate_pct, tenure_years)
-
-        balance = principal
-        rows = []
-        for month in range(1, n + 1):
-            interest_component = balance * r
-            principal_component = emi - interest_component
-            balance = max(balance - principal_component, 0)
-            rows.append(
-                {
-                    "Month": month,
-                    "Year": math.ceil(month / 12),
-                    "EMI": round(emi, 2),
-                    "Principal Paid": round(principal_component, 2),
-                    "Interest Paid": round(interest_component, 2),
-                    "Remaining Balance": round(balance, 2),
-                }
-            )
-        return pd.DataFrame(rows)
-
-    @classmethod
-    def max_eligible_loan(
-        cls,
-        monthly_income: float,
-        existing_emis: float,
-        annual_rate_pct: float,
-        tenure_years: float,
-        foir_limit_pct: float = 50.0,
-    ) -> dict:
-        """
-        Reverse-engineers the maximum loan a bank would typically sanction,
-        based on the Fixed Obligation to Income Ratio (FOIR) banks commonly use.
-        """
-        max_allowed_emi = max(monthly_income * (foir_limit_pct / 100) - existing_emis, 0)
-        r = cls.monthly_rate(annual_rate_pct)
-        n = int(round(tenure_years * 12))
-
-        if r == 0:
-            max_principal = max_allowed_emi * n
-        else:
-            max_principal = max_allowed_emi * ((1 + r) ** n - 1) / (r * (1 + r) ** n)
-
-        return {
-            "max_allowed_emi": round(max_allowed_emi, 2),
-            "max_eligible_loan": round(max_principal, 2),
-            "foir_limit_pct": foir_limit_pct,
-        }
-
-    @classmethod
-    def eligibility_check(
-        cls,
-        requested_loan: float,
-        monthly_income: float,
-        existing_emis: float,
-        annual_rate_pct: float,
-        tenure_years: float,
-        credit_score: int,
-        foir_limit_pct: float = 50.0,
-    ) -> dict:
-        requested_emi = cls.calculate_emi(requested_loan, annual_rate_pct, tenure_years)
-        elig = cls.max_eligible_loan(monthly_income, existing_emis, annual_rate_pct, tenure_years, foir_limit_pct)
-        current_foir = ((existing_emis + requested_emi) / monthly_income * 100) if monthly_income else 0
-
-        is_eligible = (requested_loan <= elig["max_eligible_loan"]) and (credit_score >= 650)
-
-        # Reasons, useful for both the UI and the chain prompt
-        reasons = []
-        if requested_loan > elig["max_eligible_loan"]:
-            reasons.append("Requested loan exceeds the FOIR-based maximum eligible amount.")
-        if credit_score < 650:
-            reasons.append("Credit score is below the commonly required threshold of 650.")
-        if not reasons:
-            reasons.append("Requested loan and EMI comfortably fit within income and credit norms.")
-
-        return {
-            "requested_emi": round(requested_emi, 2),
-            "current_foir_pct": round(current_foir, 2),
-            "is_eligible": is_eligible,
-            "max_eligible_loan": elig["max_eligible_loan"],
-            "max_allowed_emi": elig["max_allowed_emi"],
-            "reasons": reasons,
-        }
-
-
-# =============================================================================
-# 2. CHAIN — wraps the calculator's numeric output into a natural-language
-#    recommendation. Uses LangChain LCEL: calculator -> prompt -> LLM -> text
-# =============================================================================
-RECOMMENDATION_PROMPT = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            "You are a careful, neutral home-loan advisor. You are given structured "
-            "financial figures already computed by a calculator tool. Do not "
-            "recompute numbers yourself — just interpret them. Give a short, "
-            "friendly, 4-6 sentence recommendation. Mention eligibility status, "
-            "the FOIR, and 1-2 concrete next steps (e.g. reduce loan amount, "
-            "extend tenure, improve credit score, add a co-applicant). Avoid "
-            "guaranteeing loan approval since that is the bank's decision.",
-        ),
-        (
-            "human",
-            "Applicant snapshot:\n"
-            "- Requested loan amount: ₹{loan_amount:,.0f}\n"
-            "- Tenure: {tenure_years} years at {rate}% annual interest\n"
-            "- Monthly income: ₹{income:,.0f}\n"
-            "- Existing EMI obligations: ₹{existing_emis:,.0f}\n"
-            "- Credit score: {credit_score}\n\n"
-            "Calculator results:\n"
-            "- Requested EMI: ₹{requested_emi:,.0f}\n"
-            "- Resulting FOIR: {foir}%\n"
-            "- Eligible: {eligible}\n"
-            "- Max eligible loan at this rate/tenure: ₹{max_loan:,.0f}\n"
-            "- Max allowed EMI (FOIR-based): ₹{max_emi:,.0f}\n"
-            "- Reasons: {reasons}",
-        ),
-    ]
-)
-
-
-def build_chain(api_key: str, model: str = "gpt-4o-mini"):
-    """Builds the LCEL chain: inputs dict -> prompt -> LLM -> string."""
-    llm = ChatOpenAI(model=model, temperature=0.4, api_key=api_key)
-    chain = RECOMMENDATION_PROMPT | llm | StrOutputParser()
-    return chain
-
-
-def rule_based_recommendation(inputs: dict) -> str:
-    """Fallback narrative generator when no LLM/API key is available."""
-    lines = []
-    if inputs["eligible"] == "Yes":
-        lines.append(
-            f"Based on your income and existing obligations, a loan of "
-            f"₹{inputs['loan_amount']:,.0f} looks affordable — your FOIR works "
-            f"out to about {inputs['foir']}%, within typical bank comfort levels."
-        )
-    else:
-        lines.append(
-            f"A loan of ₹{inputs['loan_amount']:,.0f} at these terms pushes your "
-            f"FOIR to about {inputs['foir']}%, above what most lenders prefer. "
-            f"The FOIR-based estimate suggests up to ₹{inputs['max_loan']:,.0f} "
-            f"may be a more comfortable ceiling."
-        )
-    lines.append("Reasons noted by the calculator: " + " ".join(inputs["reasons"]))
-    lines.append(
-        "Consider: reducing the loan amount, extending the tenure to lower the "
-        "EMI, paying down existing EMIs first, or adding a co-applicant's income "
-        "to improve eligibility."
-    )
-    return " ".join(lines)
-
-
-def get_recommendation(calc_inputs: dict, api_key: str | None, model: str) -> str:
-    prompt_vars = {
-        "loan_amount": calc_inputs["loan_amount"],
-        "tenure_years": calc_inputs["tenure_years"],
-        "rate": calc_inputs["rate"],
-        "income": calc_inputs["income"],
-        "existing_emis": calc_inputs["existing_emis"],
-        "credit_score": calc_inputs["credit_score"],
-        "requested_emi": calc_inputs["requested_emi"],
-        "foir": calc_inputs["foir"],
-        "eligible": calc_inputs["eligible"],
-        "max_loan": calc_inputs["max_loan"],
-        "max_emi": calc_inputs["max_emi"],
-        "reasons": "; ".join(calc_inputs["reasons"]),
-    }
-
-    if LANGCHAIN_AVAILABLE and api_key:
-        try:
-            chain = build_chain(api_key, model)
-            return chain.invoke(prompt_vars)
-        except Exception as e:
-            return f"(LLM chain failed, showing rule-based summary instead: {e})\n\n" + rule_based_recommendation(
-                prompt_vars
-            )
-    return rule_based_recommendation(prompt_vars)
-
-
-# =============================================================================
-# 3. STREAMLIT UI
-# =============================================================================
+# ---------------------------------------------------------
+# PAGE CONFIG
+# ---------------------------------------------------------
 st.set_page_config(page_title="Home Loan / EMI Advisor", page_icon="🏠", layout="wide")
 
-st.title("🏠 Home Loan / EMI Advisor")
-st.caption("RE-03 · Intermediate · Chain + Financial Calculator Tool")
 
-with st.sidebar:
-    st.header("Loan Details")
-    loan_amount = st.number_input("Requested Loan Amount (₹)", min_value=100000, max_value=100000000,
-                                   value=4000000, step=50000)
-    annual_rate = st.slider("Annual Interest Rate (%)", min_value=5.0, max_value=15.0, value=8.5, step=0.05)
-    tenure_years = st.slider("Tenure (Years)", min_value=1, max_value=30, value=20)
+# ---------------------------------------------------------
+# CORE FINANCE FUNCTIONS
+# (These are plain Python functions - no external library needed
+#  for the maths, so it is easy to explain to a class)
+# ---------------------------------------------------------
 
-    st.header("Applicant Profile")
-    monthly_income = st.number_input("Monthly Net Income (₹)", min_value=10000, max_value=5000000,
-                                      value=100000, step=5000)
-    existing_emis = st.number_input("Existing Monthly EMI Obligations (₹)", min_value=0, max_value=1000000,
-                                     value=5000, step=1000)
-    credit_score = st.slider("Credit Score", min_value=300, max_value=900, value=740)
-    foir_limit = st.slider("Bank's FOIR Limit (%)", min_value=30, max_value=65, value=50)
+def calculate_emi(principal, annual_rate, tenure_years):
+    """
+    Calculate the Equated Monthly Installment (EMI).
 
-    st.header("AI Recommendation (optional)")
-    use_llm = st.checkbox("Use LLM chain for narrative recommendation", value=False)
-    api_key = None
-    model_choice = "gpt-4o-mini"
-    if use_llm:
-        api_key = st.text_input("OpenAI API Key", type="password")
-        model_choice = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o", "gpt-4-turbo"])
-        if not LANGCHAIN_AVAILABLE:
-            st.warning("langchain / langchain-openai not installed — falling back to rule-based summary.")
+    Formula:
+        EMI = P * r * (1 + r)^n / ((1 + r)^n - 1)
 
-calc = LoanCalculator()
+    where:
+        P = loan amount (principal)
+        r = monthly interest rate (annual rate / 12 / 100)
+        n = number of monthly installments (tenure in years * 12)
+    """
+    monthly_rate = annual_rate / (12 * 100)
+    months = tenure_years * 12
 
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["📊 EMI Calculator", "✅ Eligibility Check", "💬 Recommendation", "📈 Amortization Schedule"]
-)
+    if monthly_rate == 0:  # edge case: 0% interest loan
+        return principal / months
 
-emi = calc.calculate_emi(loan_amount, annual_rate, tenure_years)
-total_payment = emi * tenure_years * 12
-total_interest = total_payment - loan_amount
+    emi = principal * monthly_rate * (1 + monthly_rate) ** months
+    emi = emi / ((1 + monthly_rate) ** months - 1)
+    return emi
 
-elig = calc.eligibility_check(
-    loan_amount, monthly_income, existing_emis, annual_rate, tenure_years, credit_score, foir_limit
-)
 
-with tab1:
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Monthly EMI", f"₹{emi:,.0f}")
-    c2.metric("Total Interest Payable", f"₹{total_interest:,.0f}")
-    c3.metric("Total Payment", f"₹{total_payment:,.0f}")
+def generate_amortization_schedule(principal, annual_rate, tenure_years):
+    """
+    Build a month-wise repayment schedule showing how much of each
+    EMI goes towards interest vs principal, and the remaining balance.
+    Returns a pandas DataFrame.
+    """
+    monthly_rate = annual_rate / (12 * 100)
+    months = tenure_years * 12
+    emi = calculate_emi(principal, annual_rate, tenure_years)
 
-    fig = go.Figure(
-        data=[
-            go.Pie(
-                labels=["Principal", "Interest"],
-                values=[loan_amount, total_interest],
-                hole=0.5,
-                marker=dict(colors=["#2563eb", "#f97316"]),
-            )
-        ]
-    )
-    fig.update_layout(title="Principal vs. Interest Breakup", height=400)
-    st.plotly_chart(fig, use_container_width=True)
+    balance = principal
+    rows = []
+    for month in range(1, months + 1):
+        interest_payment = balance * monthly_rate
+        principal_payment = emi - interest_payment
+        balance = balance - principal_payment
+        if balance < 0:
+            balance = 0
 
-with tab2:
-    st.subheader("Eligibility Result")
-    if elig["is_eligible"]:
-        st.success("✅ Eligible based on FOIR and credit score thresholds.")
+        rows.append({
+            "Month": month,
+            "EMI": round(emi, 2),
+            "Principal Paid": round(principal_payment, 2),
+            "Interest Paid": round(interest_payment, 2),
+            "Remaining Balance": round(balance, 2)
+        })
+
+    return pd.DataFrame(rows)
+
+
+def check_eligibility(monthly_income, existing_emis, requested_loan,
+                       annual_rate, tenure_years, foir_limit=50):
+    """
+    A simplified loan-eligibility check based on FOIR
+    (Fixed Obligation to Income Ratio) - a common real-world rule
+    used by banks: total EMIs (old + new) should not exceed a
+    certain percentage (commonly 40-50%) of monthly income.
+
+    Returns a dictionary with the eligibility result and details.
+    """
+    max_allowed_emi = (foir_limit / 100) * monthly_income
+    emi_available_for_new_loan = max_allowed_emi - existing_emis
+
+    requested_emi = calculate_emi(requested_loan, annual_rate, tenure_years)
+
+    is_eligible = requested_emi <= emi_available_for_new_loan and emi_available_for_new_loan > 0
+
+    # Also estimate the maximum loan amount the person could get
+    # with the remaining EMI budget (reverse EMI formula)
+    monthly_rate = annual_rate / (12 * 100)
+    months = tenure_years * 12
+    if emi_available_for_new_loan > 0 and monthly_rate > 0:
+        max_eligible_loan = emi_available_for_new_loan * ((1 + monthly_rate) ** months - 1)
+        max_eligible_loan = max_eligible_loan / (monthly_rate * (1 + monthly_rate) ** months)
+    elif emi_available_for_new_loan > 0:
+        max_eligible_loan = emi_available_for_new_loan * months
     else:
-        st.error("❌ Not eligible at the requested amount/terms.")
+        max_eligible_loan = 0
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Requested EMI", f"₹{elig['requested_emi']:,.0f}")
-    c2.metric("Current FOIR", f"{elig['current_foir_pct']}%")
-    c3.metric("Max Eligible Loan", f"₹{elig['max_eligible_loan']:,.0f}")
-
-    st.write("**Reasons:**")
-    for r in elig["reasons"]:
-        st.write(f"- {r}")
-
-with tab3:
-    st.subheader("Personalized Recommendation")
-    calc_inputs = {
-        "loan_amount": loan_amount,
-        "tenure_years": tenure_years,
-        "rate": annual_rate,
-        "income": monthly_income,
-        "existing_emis": existing_emis,
-        "credit_score": credit_score,
-        "requested_emi": elig["requested_emi"],
-        "foir": elig["current_foir_pct"],
-        "eligible": "Yes" if elig["is_eligible"] else "No",
-        "max_loan": elig["max_eligible_loan"],
-        "max_emi": elig["max_allowed_emi"],
-        "reasons": elig["reasons"],
+    return {
+        "is_eligible": is_eligible,
+        "requested_emi": round(requested_emi, 2),
+        "max_allowed_emi": round(max_allowed_emi, 2),
+        "emi_budget_left": round(emi_available_for_new_loan, 2),
+        "max_eligible_loan": round(max_eligible_loan, 2)
     }
-    if st.button("Generate Recommendation"):
-        with st.spinner("Running the calculator → chain pipeline..."):
-            text = get_recommendation(calc_inputs, api_key if use_llm else None, model_choice)
-        st.write(text)
-    else:
-        st.info("Click the button to run the chain (LLM-based if enabled, otherwise rule-based).")
 
-with tab4:
-    st.subheader("Full Amortization Schedule")
-    schedule = calc.amortization_schedule(loan_amount, annual_rate, tenure_years)
-    yearly = schedule.groupby("Year")[["Principal Paid", "Interest Paid"]].sum().reset_index()
 
-    fig2 = go.Figure()
-    fig2.add_trace(go.Bar(x=yearly["Year"], y=yearly["Principal Paid"], name="Principal", marker_color="#2563eb"))
-    fig2.add_trace(go.Bar(x=yearly["Year"], y=yearly["Interest Paid"], name="Interest", marker_color="#f97316"))
-    fig2.update_layout(barmode="stack", title="Yearly Principal vs Interest", height=400)
-    st.plotly_chart(fig2, use_container_width=True)
+def ask_gemini_for_advice(api_key, profile_summary):
+    """
+    Send the user's loan profile to Google Gemini and get back
+    simple, friendly, easy-to-understand loan advice.
+    """
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel("gemini-1.5-flash")
 
-    st.dataframe(schedule, use_container_width=True, height=400)
-    st.download_button(
-        "Download Schedule as CSV",
-        data=schedule.to_csv(index=False).encode("utf-8"),
-        file_name=f"amortization_schedule_{date.today()}.csv",
-        mime="text/csv",
+    prompt = f"""
+    You are a friendly home loan advisor talking to a first-time home buyer.
+    Based on the details below, give short, simple, practical advice
+    (use plain language, avoid jargon, use bullet points, max 200 words).
+
+    {profile_summary}
+
+    Cover:
+    - Whether the loan looks affordable for them
+    - 2-3 tips to improve eligibility or reduce interest burden
+    - One general home-loan tip for beginners
+    """
+
+    response = model.generate_content(prompt)
+    return response.text
+
+
+# ---------------------------------------------------------
+# SIDEBAR - API KEY + USER INPUTS
+# ---------------------------------------------------------
+st.sidebar.title("⚙️ Settings")
+api_key = st.sidebar.text_input("Enter your Google Gemini API Key", type="password")
+st.sidebar.caption("Get a free key from https://aistudio.google.com/app/apikey")
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Your Details")
+
+monthly_income = st.sidebar.number_input("Monthly Income (₹)", min_value=0, value=60000, step=1000)
+existing_emis = st.sidebar.number_input("Existing Monthly EMIs (₹)", min_value=0, value=0, step=500)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Loan Details")
+loan_amount = st.sidebar.number_input("Loan Amount Required (₹)", min_value=10000, value=2500000, step=10000)
+interest_rate = st.sidebar.number_input("Annual Interest Rate (%)", min_value=1.0, value=8.5, step=0.1)
+tenure_years = st.sidebar.slider("Loan Tenure (years)", min_value=1, max_value=30, value=20)
+
+
+# ---------------------------------------------------------
+# MAIN PAGE
+# ---------------------------------------------------------
+st.title("🏠 Home Loan / EMI Advisor")
+st.write("A simple tool to calculate your EMI, check loan eligibility, "
+         "view your repayment schedule, and get AI-powered advice.")
+
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📊 EMI Calculator",
+    "✅ Eligibility Check",
+    "📅 Amortization Schedule",
+    "🤖 AI Recommendations"
+])
+
+# ---------------- TAB 1: EMI CALCULATOR ----------------
+with tab1:
+    st.subheader("EMI Calculator")
+
+    emi = calculate_emi(loan_amount, interest_rate, tenure_years)
+    total_payment = emi * tenure_years * 12
+    total_interest = total_payment - loan_amount
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Monthly EMI", f"₹ {emi:,.2f}")
+    col2.metric("Total Interest Payable", f"₹ {total_interest:,.2f}")
+    col3.metric("Total Payment (Principal + Interest)", f"₹ {total_payment:,.2f}")
+
+    # Simple pie chart: principal vs interest
+    fig, ax = plt.subplots()
+    ax.pie(
+        [loan_amount, total_interest],
+        labels=["Principal", "Total Interest"],
+        autopct="%1.1f%%",
+        startangle=90
     )
+    ax.set_title("Principal vs Interest")
+    st.pyplot(fig)
 
-st.divider()
-st.caption(
-    "This tool provides indicative estimates only and does not constitute a loan offer. "
-    "Actual eligibility and rates are determined by the lending institution."
-)
+# ---------------- TAB 2: ELIGIBILITY CHECK ----------------
+with tab2:
+    st.subheader("Loan Eligibility Check")
+    st.caption("Based on a simplified FOIR (Fixed Obligation to Income Ratio) rule "
+               "used by many banks: your total EMIs should not exceed 50% of your income.")
+
+    result = check_eligibility(monthly_income, existing_emis, loan_amount,
+                                interest_rate, tenure_years)
+
+    if result["is_eligible"]:
+        st.success("✅ You are likely ELIGIBLE for this loan!")
+    else:
+        st.error("❌ You may NOT be eligible for this loan amount right now.")
+
+    colA, colB = st.columns(2)
+    with colA:
+        st.write(f"**Required EMI for this loan:** ₹ {result['requested_emi']:,.2f}")
+        st.write(f"**Max EMI you can afford (50% rule):** ₹ {result['max_allowed_emi']:,.2f}")
+    with colB:
+        st.write(f"**EMI budget left (after existing EMIs):** ₹ {result['emi_budget_left']:,.2f}")
+        st.write(f"**Maximum loan you may be eligible for:** ₹ {result['max_eligible_loan']:,.2f}")
+
+# ---------------- TAB 3: AMORTIZATION SCHEDULE ----------------
+with tab3:
+    st.subheader("Month-by-Month Repayment Schedule")
+
+    schedule_df = generate_amortization_schedule(loan_amount, interest_rate, tenure_years)
+    st.dataframe(schedule_df, use_container_width=True, height=350)
+
+    # Line chart: how balance reduces over time
+    fig2, ax2 = plt.subplots()
+    ax2.plot(schedule_df["Month"], schedule_df["Remaining Balance"])
+    ax2.set_xlabel("Month")
+    ax2.set_ylabel("Remaining Balance (₹)")
+    ax2.set_title("Loan Balance Over Time")
+    st.pyplot(fig2)
+
+    csv = schedule_df.to_csv(index=False).encode("utf-8")
+    st.download_button("⬇️ Download Schedule as CSV", csv, "amortization_schedule.csv", "text/csv")
+
+# ---------------- TAB 4: AI RECOMMENDATIONS ----------------
+with tab4:
+    st.subheader("AI-Powered Loan Advice (Google Gemini)")
+
+    if st.button("Get AI Recommendation"):
+        if not api_key:
+            st.warning("⚠️ Please enter your Gemini API key in the sidebar first.")
+        else:
+            profile_summary = f"""
+            Monthly Income: ₹{monthly_income}
+            Existing Monthly EMIs: ₹{existing_emis}
+            Requested Loan Amount: ₹{loan_amount}
+            Interest Rate: {interest_rate}%
+            Tenure: {tenure_years} years
+            Calculated EMI: ₹{emi:,.2f}
+            Eligible: {result['is_eligible']}
+            Max Eligible Loan: ₹{result['max_eligible_loan']:,.2f}
+            """
+            with st.spinner("Asking Gemini for advice..."):
+                try:
+                    advice = ask_gemini_for_advice(api_key, profile_summary)
+                    st.markdown(advice)
+                except Exception as e:
+                    st.error(f"Something went wrong while calling Gemini API: {e}")
+    else:
+        st.info("Click the button above to get personalized, easy-to-understand loan advice.")
+
+st.markdown("---")
+st.caption("Project RE-03 | Home Loan / EMI Advisor | Built with Streamlit + Google Gemini API")
