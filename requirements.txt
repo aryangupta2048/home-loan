@@ -1,9 +1,4 @@
 streamlit
 pandas
-numpy
-plotly
-langchain
-langchain-core
-langchain-openai
-openai
-python-dotenv
+matplotlib
+google-genai
