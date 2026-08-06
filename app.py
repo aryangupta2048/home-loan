@@ -16,7 +16,7 @@ Author: Student Project (RE-03)
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
-import google.generativeai as genai
+from google import genai
 
 # ---------------------------------------------------------
 # PAGE CONFIG
@@ -125,9 +125,11 @@ def ask_gemini_for_advice(api_key, profile_summary):
     """
     Send the user's loan profile to Google Gemini and get back
     simple, friendly, easy-to-understand loan advice.
+
+    Uses the current google-genai SDK (client.models.generate_content),
+    not the older/deprecated google-generativeai package.
     """
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-3.5-flash")
+    client = genai.Client(api_key=api_key)
 
     prompt = f"""
     You are a friendly home loan advisor talking to a first-time home buyer.
@@ -142,7 +144,10 @@ def ask_gemini_for_advice(api_key, profile_summary):
     - One general home-loan tip for beginners
     """
 
-    response = model.generate_content(prompt)
+    response = client.models.generate_content(
+        model="gemini-3.5-flash",
+        contents=prompt
+    )
     return response.text
 
 
