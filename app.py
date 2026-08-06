@@ -145,7 +145,7 @@ def ask_gemini_for_advice(api_key, profile_summary):
     """
 
     response = client.models.generate_content(
-        model="gemini-3.1-flash",
+        model="gemini-3.5-flash",
         contents=prompt
     )
     return response.text
