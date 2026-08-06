@@ -127,7 +127,7 @@ def ask_gemini_for_advice(api_key, profile_summary):
     simple, friendly, easy-to-understand loan advice.
     """
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = genai.GenerativeModel("gemini-3.5-flash")
 
     prompt = f"""
     You are a friendly home loan advisor talking to a first-time home buyer.
